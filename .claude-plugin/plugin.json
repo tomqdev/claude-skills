@@ -1,11 +1,11 @@
 {
-  "name": "carebare47",
-  "version": "1.3.0",
+  "name": "tomqdev",
+  "version": "2.0.0",
   "description": "Personal Claude Code skills. review-pr: read-only, multi-agent review of a GitHub pull request. resume-crashed-sessions: find and resume sessions after a crash.",
   "author": {
     "name": "Tom Queen",
-    "url": "https://github.com/carebare47"
+    "url": "https://github.com/tomqdev"
   },
-  "repository": "https://github.com/carebare47/claude-skills",
+  "repository": "https://github.com/tomqdev/claude-skills",
   "license": "MIT"
 }

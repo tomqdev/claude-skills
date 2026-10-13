@@ -1,14 +1,14 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "carebare47",
-  "description": "Personal Claude Code skills from carebare47.",
+  "name": "tomqdev",
+  "description": "Personal Claude Code skills from tomqdev.",
   "owner": {
     "name": "Tom Queen",
-    "url": "https://github.com/carebare47"
+    "url": "https://github.com/tomqdev"
   },
   "plugins": [
     {
-      "name": "carebare47",
+      "name": "tomqdev",
       "description": "Personal Claude Code skills. review-pr: read-only, multi-agent review of a GitHub pull request. resume-crashed-sessions: find and resume sessions after a crash.",
       "source": "./",
       "category": "development"

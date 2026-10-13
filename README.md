@@ -5,11 +5,11 @@ Personal [Claude Code](https://claude.com/claude-code) skills, packaged as a plu
 ## Install
 
 ```
-/plugin marketplace add carebare47/claude-skills
-/plugin install carebare47@carebare47
+/plugin marketplace add tomqdev/claude-skills
+/plugin install tomqdev@tomqdev
 ```
 
-Update with `/plugin marketplace update carebare47`.
+Update with `/plugin marketplace update tomqdev`.
 
 ## Skills
 
