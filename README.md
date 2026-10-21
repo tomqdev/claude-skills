@@ -30,6 +30,26 @@ Reviews a GitHub pull request locally with several review agents in parallel. It
 
 Requires `gh`, `git`, Python 3.8+, and these plugins: `pr-review-toolkit`, `superpowers` and `atlassian` from the official marketplace, and `ponytail` from the `DietrichGebert/ponytail` marketplace.
 
+### layered-review
+
+```
+/layered-review https://github.com/<owner>/<repo>/pull/<number> [--depth quick|standard|deep] [--full]
+```
+
+A merge-gate review based on [Solving code review at Anthropic](https://claude.dev/blog/solving-code-review-at-anthropic/). It reports only verified bugs and says how much human review the PR needs. It never posts to GitHub. Use `review-pr` for the broader style, simplification and comment review.
+
+- Bug hunters with different lenses (intent, breakage, line-level, and at `deep` also state and tests) and a separate security hunter review the PR in parallel against the whole repository.
+- Separate verifiers try to disprove every candidate and vote on it. Only candidates with enough votes are reported, tagged Important, Security, Nit or Pre-existing. Style and cleanup are dropped.
+- Depth sets the number of hunters and verifiers: `quick` 1 and 1, `standard` 3 and 3, `deep` 5 and 5.
+- A risk classifier sets a tier from the change: Low needs 0 human approvals, Medium 1 and High 2. CI workflows, CODEOWNERS and paths `REVIEW.md` marks always need a person, and only owners, members and collaborators can get Low. It names required reviewers from `CODEOWNERS`, checks the PR description for Testing, Risk and How to revert, and points a human at the few places worth reading.
+- The gate is Blocked, Waiting on CI or Ready for N approvals. It is blocked by Important and Security findings, open review threads and failing CI.
+- Reads `CLAUDE.md`, `REVIEW.md`, `CODEOWNERS` and the PR template from the base branch, so a PR can't rewrite the rules it is reviewed against. `REVIEW.md` can say what failure looks like, which paths to skip, a nit cap, which paths always need a person, and the depth.
+- Remembers each round in `~/.local/state/tomqdev-layered-review/` (or `$XDG_STATE_HOME`). Later runs check earlier findings instead of reporting them again. From round 3 on, they review only the files that changed since the previous round; `--full` reviews the whole diff instead. After 3 rounds that still have blockers, the summary says to rethink the approach. Delete the PR's state directory to start over.
+- In round 1, checks the PR against its Jira ticket when the Atlassian plugin is logged in, using review-pr's Jira check.
+- If the current directory is a clone of the PR's repository, fetches the head commit so agents can search it with `git grep`.
+
+Requires `gh`, `git`, Python 3.8+ and the `review-pr` skill from this plugin, whose fetch script it reuses. The Jira check needs the `atlassian` plugin.
+
 ### resume-crashed-sessions
 
 ```
