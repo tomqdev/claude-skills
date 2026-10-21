@@ -252,6 +252,11 @@ def parse_arguments() -> argparse.Namespace:
         help="Review depth. Reported back as requested_depth; the skill decides what it means.",
     )
     argument_parser.add_argument(
+        "--junior",
+        action="store_true",
+        help="Review code from a junior engineer: also suggest better ways to write it.",
+    )
+    argument_parser.add_argument(
         "--full",
         action="store_true",
         help="Review the whole diff even in rounds that would review only what changed.",
@@ -361,6 +366,7 @@ def main() -> None:
         {
             **summary,
             "requested_depth": arguments.depth,
+            "junior": arguments.junior,
             "owner": location["owner"],
             "repository": location["repository"],
             "number": location["number"],

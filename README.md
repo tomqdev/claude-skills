@@ -33,7 +33,7 @@ Requires `gh`, `git`, Python 3.8+, and these plugins: `pr-review-toolkit`, `supe
 ### layered-review
 
 ```
-/layered-review https://github.com/<owner>/<repo>/pull/<number> [--depth quick|standard|deep] [--full]
+/layered-review https://github.com/<owner>/<repo>/pull/<number> [--depth quick|standard|deep] [--junior] [--full]
 ```
 
 A merge-gate review based on [Solving code review at Anthropic](https://claude.dev/blog/solving-code-review-at-anthropic/). It reports only verified bugs and says how much human review the PR needs. It never posts to GitHub. Use `review-pr` for the broader style, simplification and comment review.
@@ -41,6 +41,7 @@ A merge-gate review based on [Solving code review at Anthropic](https://claude.d
 - Bug hunters with different lenses (intent, breakage, line-level, and at `deep` also state and tests) and a separate security hunter review the PR in parallel against the whole repository.
 - Separate verifiers try to disprove every candidate and vote on it. Only candidates with enough votes are reported, tagged Important, Security, Nit or Pre-existing. Style and cleanup are dropped.
 - Depth sets the number of hunters and verifiers: `quick` 1 and 1, `standard` 3 and 3, `deep` 5 and 5.
+- `--junior` is for code from junior engineers. A craft hunter looks at the lines the PR changed for inefficient code, hand-rolled versions of existing helpers, unidiomatic or tangled code, misleading names, and departures from the repository's own conventions. Verifiers keep a suggestion only if it behaves the same, is clearly better rather than a matter of taste, and fits how the repository already does things. Each suggestion shows a before and after, ready to pass on, and the review lists habits that recur. Up to 10 suggestions are shown. They don't block the merge, but the risk tier is at least Medium.
 - A risk classifier sets a tier from the change: Low needs 0 human approvals, Medium 1 and High 2. CI workflows, CODEOWNERS and paths `REVIEW.md` marks always need a person, and only owners, members and collaborators can get Low. It names required reviewers from `CODEOWNERS`, checks the PR description for Testing, Risk and How to revert, and points a human at the few places worth reading.
 - The gate is Blocked, Waiting on CI or Ready for N approvals. It is blocked by Important and Security findings, open review threads and failing CI.
 - Reads `CLAUDE.md`, `REVIEW.md`, `CODEOWNERS` and the PR template from the base branch, so a PR can't rewrite the rules it is reviewed against. `REVIEW.md` can say what failure looks like, which paths to skip, a nit cap, which paths always need a person, and the depth.

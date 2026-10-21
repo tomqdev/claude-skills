@@ -14,7 +14,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-FINDING_TAGS = ("important", "security", "nit", "pre-existing")
+FINDING_TAGS = ("important", "security", "nit", "suggestion", "pre-existing")
 REQUIRED_FINDING_FIELDS = ("id", "tag", "file", "title")
 
 
@@ -43,7 +43,7 @@ def parse_arguments() -> argparse.Namespace:
     argument_parser = argparse.ArgumentParser(description=__doc__)
     argument_parser.add_argument("round_context_path", help="round_context_path from prepare.py.")
     argument_parser.add_argument(
-        "findings_path", help='JSON with "depth", "open" and "fixed" findings.'
+        "findings_path", help='JSON with "depth", "junior", "open" and "fixed" findings.'
     )
     return argument_parser.parse_args()
 
@@ -64,6 +64,7 @@ def main() -> None:
                 "head_commit": round_context["head_commit"],
                 "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "depth": findings.get("depth"),
+                "junior": findings.get("junior", False),
                 "review_scope": round_context["review_scope"],
                 "open": findings["open"],
                 "fixed": findings["fixed"],

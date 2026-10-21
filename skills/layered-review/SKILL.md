@@ -1,11 +1,13 @@
 ---
 name: layered-review
-description: Use when the user asks for a merge-gate review of a GitHub pull request locally: only verified bugs, a separate security pass, and how many humans need to approve it. Never posts comments.
+description: Use when the user asks for a merge-gate review of a GitHub pull request locally: only verified bugs, a separate security pass, and how many humans need to approve it. With --junior, also suggests better ways to write the code, for PRs from junior engineers. Never posts comments.
 ---
 
 # Layered PR review
 
 Review a GitHub pull request the way the Claude Code team describes in [Solving code review at Anthropic](https://claude.dev/blog/solving-code-review-at-anthropic/). Bug hunters work in parallel. Separate verifiers vote on every finding, and only findings that pass are reported. A separate pass looks for security holes, and a risk tier says how many people need to approve the PR. Leave out style, cleanup and coverage nags: `review-pr` covers those.
+
+`--junior` is for code from junior engineers. It adds a craft hunter that finds code that works but could be written better, such as inefficient functions, hand-rolled helpers, and unidiomatic or tangled code. Each suggestion is verified and shows the better version.
 
 The review is read-only. Never post comments, approve, request changes, push, commit or edit files. The only writes allowed are the review's temp files, its round state, and fetching the PR's head commit into a local clone.
 
@@ -16,7 +18,7 @@ The first argument is the PR URL, e.g. `https://github.com/org/repo/pull/123`. P
 ## 1. Prepare
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/scripts/prepare.py" "<PR_URL>" [--depth quick|standard|deep] [--full] [--exclude GLOB ...] [--keep-editor-serialized]
+python3 "${CLAUDE_SKILL_DIR}/scripts/prepare.py" "<PR_URL>" [--depth quick|standard|deep] [--junior] [--full] [--exclude GLOB ...] [--keep-editor-serialized]
 ```
 
 The script runs review-pr's `fetch_pr.py`, so everything review-pr says about the fetch holds here. `gh` runs with `GH_TOKEN` removed, so prefix any other `gh` call in this review with `env -u GH_TOKEN`. The diff's line counts are checked against the PR metadata. Unity editor-serialized files and any `--exclude` globs are left out of the review diff. The PR discussion is written to a file, and Jira ticket keys are found. Then the script adds:
@@ -34,6 +36,7 @@ Read every file in `guidance_files`. From `REVIEW.md` files, note:
 - what failure looks like in this repository or area
 - paths to skip
 - a cap on nits. The default is 5.
+- a cap on suggestions in junior mode. The default is 10.
 - paths that always need a person
 - a review depth
 - anything else it tells the reviewer to do or not do
@@ -50,18 +53,19 @@ The depth comes from `requested_depth` if it is set, then from a depth that `REV
 | standard | 3: intent, breakage, line-level | 3 | 2 |
 | deep | 5: standard plus state, tests | 5 | 3 |
 
-Every depth also runs the security hunter and the risk classifier. When the PR touches billing, auth, data migrations, release or update machinery, or CI workflows and was not reviewed at `deep`, say in the summary that a deep review is recommended.
+Every depth also runs the security hunter and the risk classifier. When `junior` is true, every depth also runs the craft hunter. When the PR touches billing, auth, data migrations, release or update machinery, or CI workflows and was not reviewed at `deep`, say in the summary that a deep review is recommended.
 
 ## 3. Hunt
 
 Launch these in a single message with the Agent tool, all `general-purpose`:
 - the bug hunters for the depth, one per lens
 - the security hunter
+- the craft hunter, if `junior` is true
 - the risk classifier
 - the prior-findings checker, if `open_prior_finding_count` is not zero and `same_head_as_previous_round` is false. At an unchanged head, earlier findings stay open as they were.
 - the Jira checker, in round 1 only, if `jira_ticket_keys` is not empty and ToolSearch finds the Atlassian `getJiraIssue` tool. Use the Jira Scope prompt from `${CLAUDE_SKILL_DIR}/../review-pr/SKILL.md`, with this skill's required block in place of review-pr's. If the tool is missing, skip the checker and say so in the summary. Later rounds skip it too.
 
-If `review_scope` is `changed_since_previous_round` and `files_changed_since_previous_round` is empty, skip the bug and security hunters, because nothing they would review has changed.
+If `review_scope` is `changed_since_previous_round` and `files_changed_since_previous_round` is empty, skip the bug, security and craft hunters, because nothing they would review has changed.
 
 Sub-agents do not share your shell, so write literal values from the JSON summary into every prompt, never shell variables. Every prompt must contain this block:
 
@@ -95,7 +99,7 @@ env -u GH_TOKEN gh api "repos/{owner}/{repository}/contents/<path>?ref={head_com
 You cannot search the whole repository. Say so in your output when that limits a finding.
 ```
 
-The bug hunters and the security hunter also get:
+The bug, security and craft hunters also get:
 
 ```
 Review scope: {scope_diff_path}.
@@ -155,6 +159,62 @@ Lenses:
 - Line-level: Look for logic errors in the changed lines: wrong conditions, off-by-one, null or empty handling, wrong units or types, error handling that hides failures or leaves state half-written, leaked resources, wrong defaults and copy-paste mistakes.
 - State (deep only): Look at concurrency, ordering, retries and idempotency, caching and invalidation, lifecycle (start, stop, reload), partial failure, and what happens when the code runs twice or not at all.
 - Tests (deep only): Do the tests that the PR adds or changes exercise the behaviour it changes? Would they fail if the change were reverted? Tests that pass whatever the code does, assert the wrong thing, or were changed to match a bug are findings. Missing coverage on its own is not.
+
+Craft hunter prompt, junior mode only:
+
+```
+You are reviewing a pull request from a junior engineer, to help them write
+better code. Find code this PR adds or changes that works but could be
+written better, and show the better way. Other agents hunt for bugs; if you
+spot one, report it too. Other agents will also check every suggestion, so
+suggest only what you can show is better.
+
+## What the PR is for
+{PR title, and the body summarised in a few sentences}
+
+{the required block, scope and already-reported list above}
+
+## Look for
+- Efficiency: repeated work inside loops, linear searches where a set or
+  dict lookup would do, I/O, queries or network calls that could be batched
+  or hoisted, building or reading more data than needed, needless copies.
+- Reuse: hand-rolled code for something that the standard library, a
+  dependency the project already has, or an existing helper in this
+  repository already does. Name the function and where it lives.
+- Idiom: constructs that fight the language or framework when an idiomatic
+  form is shorter and clearer.
+- Simplicity: deep nesting, functions doing several jobs, flag arguments,
+  duplicated blocks, dead code, and abstraction or configurability that
+  nothing needs.
+- Clarity: names that mislead, magic numbers, and comments that repeat or
+  contradict the code.
+- Consistency: departures from how the surrounding code, CLAUDE.md,
+  REVIEW.md and the linter config do the same thing.
+
+## Rules
+- Only lines this PR added or changed. Leave older code alone.
+- Match this codebase, not your own taste. Read nearby files first. If the
+  repository consistently does something one way, do not push another.
+- Skip anything that a formatter or linter run by CI already enforces.
+- Every suggestion shows the better version, and the better version
+  behaves the same. If it would not, say exactly how it differs.
+- One suggestion per habit. If the same thing happens in several places,
+  report it once with every location.
+- Put efficiency and reuse before idiom, simplicity and clarity.
+- Explain why in a sentence or two that a junior engineer would learn from.
+  Be specific and kind, not preachy.
+- If the code is already good, say so.
+
+## Output
+One block per suggestion:
+### <short title>
+- Location: file:line, and every other instance
+- Category: efficiency, reuse, idiom, simplicity, clarity or consistency
+- Why: one or two sentences
+- Before: the current code, a few lines at most
+- After: the suggested code
+- Behaviour: same, or how it differs
+```
 
 Security hunter prompt:
 
@@ -220,6 +280,7 @@ Paths REVIEW.md says always need a person: {list, or "none"}
   files, and the paths REVIEW.md lists.
 - Only an OWNER, MEMBER or COLLABORATOR can get Low. Anyone else, and any
   bot, gets at least Medium.
+{when junior is true: "- The author is a junior engineer, so the tier is at least Medium."}
 - Ask separately whether this change needs a person even though its tier
   says it does not, e.g. it is hard to revert, it touches shared
   infrastructure, or it makes a product decision.
@@ -276,7 +337,7 @@ removed) | file:line at head | your evidence in one sentence.
 
 ## 4. Verify
 
-Collect the candidates from the bug and security hunters. Merge candidates that describe the same defect, or the same class, into one candidate with every location. Before voting, drop:
+Collect the candidates from the bug and security hunters, and from the craft hunter in junior mode. Mark the craft hunter's suggestions as suggestions; a bug it reports is an ordinary candidate. Merge candidates that describe the same defect, or the same class, into one candidate with every location. Before voting, drop:
 - candidates on an excluded or skipped path
 - candidates matching an open prior finding, since the checker handles those
 - candidates that a review thread in the PR discussion already raised. Keep the thread's URL for the summary.
@@ -296,7 +357,9 @@ code.
 
 ## Candidates
 {each candidate: id, title, every location, class, trigger, impact,
-pre-existing, and whether it came from the bug or the security hunter}
+pre-existing, and whether it came from the bug or the security hunter.
+For a suggestion: id, title, every location, category, why, before, after
+and behaviour.}
 
 For each candidate:
 1. Read the code at every location at {head_commit}. Read enough around it
@@ -317,14 +380,29 @@ For each candidate:
 5. Check the locations. Drop any that do not have the defect. Add any other
    instance of the same class that you find.
 
+{when junior is true:
+"Candidates marked as suggestions are judged differently, and step 3 does
+not apply to them. A suggestion is real only if all of these hold:
+- the code it targets is in lines this PR added or changed
+- the suggested version behaves the same, or the difference is spelled out
+  and harmless
+- it is clearly better: faster at realistic sizes, reuses something that
+  already exists, or is shorter and clearer. A different taste is not
+  better.
+- it fits how this repository already writes the same thing
+- no formatter or linter run by CI already covers it
+Tag a real suggestion `suggestion`. If the inefficiency would cause a real
+problem at realistic sizes, tag it `important` instead. Check its locations
+as in step 5."}
+
 ## Output
 One line per candidate:
 C<n> | REAL or NOT REAL | tag if real | file:line evidence | one sentence why
 ```
 
-Keep a candidate if it gets at least the depth's number of REAL votes. Its tag is the most common tag among the REAL votes. On a tie, take the more severe tag, in the order security, important, nit, pre-existing. Keep the locations that most of the REAL votes confirm.
+Keep a candidate if it gets at least the depth's number of REAL votes. Its tag is the most common tag among the REAL votes. On a tie, take the more severe tag, in the order security, important, nit, suggestion, pre-existing. Keep the locations that most of the REAL votes confirm.
 
-Apply the nit cap. Keep the nits with the most REAL votes and count the ones left out.
+Apply the nit cap, and in junior mode the suggestion cap. Keep the ones with the most REAL votes, putting efficiency and reuse suggestions first when votes tie, and count the ones left out.
 
 If the Jira checker ran, check each Missing and Contradictions item against the review diff and the code at the head commit yourself. Drop the ones that are wrong.
 
@@ -335,7 +413,7 @@ These block the merge:
 - open review threads on the PR (`unresolved_review_thread_count`). Every finding is either fixed or answered with a reason before merge.
 - failing or cancelled CI checks (`ci_checks.not_passing`)
 
-These do not block, but each needs a fix or a one-line reason: nits, pre-existing findings, and threads the author resolved without replying (`resolved_by_author_without_reply_count`). For the last, suggest running `/review-pr` to check whether those threads were really dealt with.
+These do not block, but each needs a fix or a one-line reason: nits, suggestions, pre-existing findings, and threads the author resolved without replying (`resolved_by_author_without_reply_count`). For the last, suggest running `/review-pr` to check whether those threads were really dealt with.
 
 The verdict:
 - Blocked: anything blocks.
@@ -352,6 +430,7 @@ Open with the count. If nothing needs fixing, say so plainly in the heading.
 ## {i + s} to fix ({i} important, {s} security) · {n} nits · {p} pre-existing
 or
 ## Nothing needs fixing
+In junior mode, add " · {g} suggestions" to either heading.
 
 **Gate:** Blocked | Waiting on CI | Ready for {N} approvals. One line per reason.
 **Risk:** {tier}, {approvals}. Why, in one sentence. Required reviewers.
@@ -362,6 +441,8 @@ Then these sections, leaving out empty ones:
 - **Important** and **Security**: each `file:line`, its title, then the trigger and impact in one sentence, the fix, `votes k/V`, and other instances of its class.
 - **Still open from earlier rounds**: Important and Security findings in full. Give only counts for the rest.
 - **Nits**: shown as "{shown} of {total}".
+- **Suggestions**, in junior mode: shown as "{shown} of {total}", efficiency and reuse first. Each gets its `file:line` and other locations, a title, why it is better, a short before and after snippet, and `votes k/V`. Write them so the user can pass them straight on to the author.
+- **Patterns to work on**, in junior mode: up to three habits that recur across the suggestions, each in one sentence. Leave this out if nothing recurs.
 - **Pre-existing**: marked as not blocking.
 - **Already raised on the PR**: thread URLs of candidates that were dropped as repeats.
 - **Jira**: the ticket line and verdict, plus verified Missing, Beyond the ticket and Contradictions items. Scope is a person's call, so it does not block the gate. If the checker replied JIRA UNAVAILABLE, or was skipped, say why.
@@ -378,6 +459,7 @@ Write the findings to `findings.json` next to `round_context_path`:
 ```json
 {
   "depth": "standard",
+  "junior": false,
   "open": [
     {"id": "R2-1", "tag": "important", "file": "src/a.py", "line": 42, "title": "Retry loop never stops", "class": "unbounded retry"}
   ],
@@ -387,7 +469,7 @@ Write the findings to `findings.json` next to `round_context_path`:
 }
 ```
 
-`open` holds every finding reported this round, of every tag, plus earlier findings that are still present. At an unchanged head, earlier findings stay in `open` as they were. `fixed` holds earlier findings that the checker found fixed or gone. New findings get ids `R{round}-1`, `R{round}-2` and so on. Earlier findings keep their ids. Then run:
+`open` holds every finding reported this round, of every tag including suggestions, plus earlier findings that are still present. At an unchanged head, earlier findings stay in `open` as they were. `fixed` holds earlier findings that the checker found fixed or gone. New findings get ids `R{round}-1`, `R{round}-2` and so on. Earlier findings keep their ids. Then run:
 
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/scripts/record_round.py" "<round_context_path>" "<findings.json>"
