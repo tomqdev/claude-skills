@@ -1,6 +1,6 @@
 {
   "name": "tomqdev",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Personal Claude Code skills. review-pr: read-only, multi-agent review of a GitHub pull request. layered-review: read-only merge gate with verified bug findings, a security pass and a risk tier. resume-crashed-sessions: find and resume sessions after a crash.",
   "author": {
     "name": "Tom Queen",

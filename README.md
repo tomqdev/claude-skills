@@ -24,6 +24,7 @@ Reviews a GitHub pull request locally with several review agents in parallel. It
 - Fetches the PR diff once and checks its line counts against the PR metadata. Every agent reviews that one diff, so stacked PRs are reviewed against their real base, not `main`.
 - Leaves Unity editor-serialized files (`.prefab`, `.unity`, `.asset`, `.meta` and similar) out of the review diff. Add more with `--exclude GLOB`, or keep them with `--keep-editor-serialized`.
 - Runs `gh` with `GH_TOKEN` unset, so `gh` uses its stored login from `gh auth login`.
+- Uses GitHub's REST API, so it also works in Claude Code cloud sessions, where GraphQL is blocked. Only whether review threads are resolved, which REST lacks, comes from the session's `ccr/review_threads` route, or from GraphQL elsewhere.
 - Checks whether earlier review comments were dealt with, including threads marked resolved whose code never changed, and threads the PR author resolved without replying.
 - Finds Jira ticket keys such as `ERD-1234` in the branch name, PR title or Jira links, and checks the PR against the ticket, its comments and linked issues. Needs the Atlassian plugin, logged in via `/mcp`.
 - Checks each serious finding against the code before reporting it.
@@ -48,6 +49,7 @@ A merge-gate review based on [Solving code review at Anthropic](https://claude.d
 - Remembers each round in `~/.local/state/tomqdev-layered-review/` (or `$XDG_STATE_HOME`). Later runs check earlier findings instead of reporting them again. From round 3 on, they review only the files that changed since the previous round; `--full` reviews the whole diff instead. After 3 rounds that still have blockers, the summary says to rethink the approach. Delete the PR's state directory to start over.
 - In round 1, checks the PR against its Jira ticket when the Atlassian plugin is logged in, using review-pr's Jira check.
 - If the current directory is a clone of the PR's repository, fetches the head commit so agents can search it with `git grep`.
+- Works in Claude Code cloud sessions, like review-pr. CI checks come from the REST check runs and commit status APIs.
 
 Requires `gh`, `git`, Python 3.8+ and the `review-pr` skill from this plugin, whose fetch script it reuses. The Jira check needs the `atlassian` plugin.
 

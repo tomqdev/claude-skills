@@ -19,6 +19,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/fetch_pr.py" "<PR_URL>" [--exclude GLOB ...
 
 The script:
 - calls `gh` with `GH_TOKEN` removed, so `gh` uses its stored login. Prefix any other `gh` call in this review with `env -u GH_TOKEN`.
+- reads GitHub through its REST API, so it also works in Claude Code cloud sessions, where GraphQL is blocked. Use `gh api repos/...` for any other call too, not `gh pr`, which uses GraphQL. REST does not say whether a review thread is resolved, so that comes from the session's `ccr/review_threads` route, or from GraphQL outside cloud sessions. If neither answers, those threads have `is_resolved: null` and count as unresolved, and `review_thread_resolution_unavailable` in the summary says why. Say so in your summary.
 - checks that the diff's line counts match the PR metadata, and exits non-zero if they don't.
 - writes a review diff that leaves out Unity editor-serialized files (`.prefab`, `.unity`, `.asset`, `.meta`, `.mat` and similar) plus any `--exclude` globs.
 - writes the PR discussion to a file: review threads with their resolved and outdated flags, review summaries, and conversation comments. Each thread also records who resolved it, and whether the PR author resolved someone else's thread without ever replying in it.
