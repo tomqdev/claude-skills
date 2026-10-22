@@ -42,6 +42,18 @@ GITHUB_REMOTE_URL_PATTERN = re.compile(
 ROUND_RECORD_NAME_PATTERN = re.compile(r"^round-(\d+)\.json$")
 
 CHECK_BUCKETS = ("pass", "fail", "pending", "skipping", "cancel")
+# How `gh pr checks` buckets a check by its upper-cased state. Anything else, such as queued or
+# in progress, is pending.
+CHECK_BUCKET_BY_STATE = {
+    "SUCCESS": "pass",
+    "SKIPPED": "skipping",
+    "NEUTRAL": "skipping",
+    "ERROR": "fail",
+    "FAILURE": "fail",
+    "TIMED_OUT": "fail",
+    "ACTION_REQUIRED": "fail",
+    "CANCELLED": "cancel",
+}
 
 
 def run_fetch_pr(arguments: argparse.Namespace) -> dict:
@@ -149,21 +161,28 @@ def is_guidance_path(path: str) -> bool:
     )
 
 
-def summarise_ci_checks(pull_request_url: str) -> dict:
-    completed_process = subprocess.run(
-        ["gh", "pr", "checks", pull_request_url, "--json", "name,bucket"],
-        env={name: value for name, value in os.environ.items() if name != "GH_TOKEN"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    # gh exits non-zero when a check failed or is pending, but still prints the JSON.
-    if completed_process.stdout.strip():
-        checks = json.loads(completed_process.stdout)
-    elif "no checks reported" in completed_process.stderr:
-        checks = []
-    else:
-        return {"error": completed_process.stderr.strip()}
+def summarise_ci_checks(location: dict[str, str], head_commit: str) -> dict:
+    """Check runs and commit statuses on the head commit, which together are what `gh pr checks`
+    lists. GitHub returns only the latest run of each check and status of each context."""
+    commit_path = "repos/{owner}/{repository}/commits/".format(**location) + head_commit
+    try:
+        check_runs = fetch_pr.fetch_all_pages(f"{commit_path}/check-runs", "check_runs")
+        statuses = fetch_pr.fetch_all_pages(f"{commit_path}/status", "statuses")
+    except fetch_pr.PullRequestFetchError as fetch_error:
+        return {"error": str(fetch_error)}
+    checks = [
+        {
+            "name": check_run["name"],
+            "state": (
+                check_run["conclusion"]
+                if check_run["status"] == "completed"
+                else check_run["status"]
+            ),
+        }
+        for check_run in check_runs
+    ] + [{"name": status["context"], "state": status["state"]} for status in statuses]
+    for check in checks:
+        check["bucket"] = CHECK_BUCKET_BY_STATE.get((check["state"] or "").upper(), "pending")
     counts = dict.fromkeys(CHECK_BUCKETS, 0)
     for check in checks:
         counts[check["bucket"]] = counts.get(check["bucket"], 0) + 1
@@ -377,7 +396,7 @@ def main() -> None:
             "guidance_files": guidance_files,
             "guidance_lookup": guidance_lookup,
             "guidance_files_changed_by_pr": [path for path in changed_paths if is_guidance_path(path)],
-            "ci_checks": summarise_ci_checks(summary["pull_request_url"]),
+            "ci_checks": summarise_ci_checks(location, summary["head_commit"]),
             "local_clone": local_clone,
             "state_dir": str(state_directory),
             "round": round_number,

@@ -410,7 +410,7 @@ If the Jira checker ran, check each Missing and Contradictions item against the 
 
 These block the merge:
 - Important and Security findings, both new ones and ones the checker found still present
-- open review threads on the PR (`unresolved_review_thread_count`). Every finding is either fixed or answered with a reason before merge.
+- open review threads on the PR (`unresolved_review_thread_count`). Every finding is either fixed or answered with a reason before merge. If the summary has `review_thread_resolution_unavailable`, the count includes threads whose state is unknown: say so, with its reason.
 - failing or cancelled CI checks (`ci_checks.not_passing`)
 
 These do not block, but each needs a fix or a one-line reason: nits, suggestions, pre-existing findings, and threads the author resolved without replying (`resolved_by_author_without_reply_count`). For the last, suggest running `/review-pr` to check whether those threads were really dealt with.

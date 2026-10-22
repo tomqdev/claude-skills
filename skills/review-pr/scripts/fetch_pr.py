@@ -3,6 +3,10 @@
 
 The review diff omits Unity editor-serialized files. Their YAML is rewritten wholesale by the
 editor on save, so reviewing it produces findings about serialization noise rather than code.
+
+Everything comes from GitHub's REST API, because Claude Code cloud sessions block GraphQL. The
+one exception is whether review threads are resolved, which REST does not expose: cloud
+sessions serve it on a ccr/review_threads route, and elsewhere it comes from GraphQL.
 """
 
 from __future__ import annotations
@@ -55,43 +59,26 @@ BRANCH_JIRA_TICKET_KEY_PATTERN = re.compile(rf"^(?:[^/]+/)*({JIRA_TICKET_KEY})(?
 TITLE_JIRA_TICKET_KEY_PATTERN = re.compile(rf"^\[?({JIRA_TICKET_KEY})(?![A-Za-z0-9])")
 JIRA_BROWSE_LINK_PATTERN = re.compile(rf"/browse/({JIRA_TICKET_KEY})(?![A-Za-z0-9])")
 
-PULL_REQUEST_METADATA_FIELDS = (
-    "url,title,body,author,baseRefName,headRefName,additions,deletions,files,commits"
-)
+REST_PAGE_SIZE = 100
 
+# Not documented, so the review thread parser accepts GraphQL-style and REST-style field names.
+CCR_REVIEW_THREADS_ROUTE = "repos/{owner}/{repository}/pulls/{number}/ccr/review_threads"
+CCR_THREAD_LIST_KEYS = ("review_threads", "reviewThreads", "threads", "nodes")
+CCR_THREAD_COMMENT_ID_KEYS = ("comment_id", "root_comment_id", "first_comment_id")
+CCR_COMMENT_ID_KEYS = ("id", "database_id", "databaseId", "comment_id")
 
-PULL_REQUEST_CONNECTION_QUERY_TEMPLATE = """
+REVIEW_THREAD_RESOLUTION_QUERY = """
 query($owner: String!, $repository: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $repository) {
     pullRequest(number: $number) {
-      CONNECTION_NAME(first: 100, after: $cursor) {
+      reviewThreads(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
-        nodes { NODE_FIELDS }
+        nodes { isResolved resolvedBy { login } comments(first: 1) { nodes { databaseId } } }
       }
     }
   }
 }
 """
-
-AUTHOR_FIELDS = "author { login __typename }"
-
-REVIEW_THREAD_FIELDS = f"""
-isResolved
-isOutdated
-path
-line
-originalLine
-diffSide
-resolvedBy {{ login }}
-comments(first: 100) {{
-  pageInfo {{ hasNextPage }}
-  nodes {{ {AUTHOR_FIELDS} body createdAt url diffHunk }}
-}}
-"""
-
-REVIEW_FIELDS = f"{AUTHOR_FIELDS} state body submittedAt url"
-
-CONVERSATION_COMMENT_FIELDS = f"{AUTHOR_FIELDS} body createdAt url"
 
 
 class PullRequestFetchError(RuntimeError):
@@ -117,20 +104,156 @@ def run_gh_with_stored_login(gh_arguments: list[str]) -> str:
     return completed_process.stdout
 
 
-def fetch_all_connection_nodes(
-    pull_request_location: dict[str, str], connection_name: str, node_fields: str
-) -> list[dict]:
-    query = PULL_REQUEST_CONNECTION_QUERY_TEMPLATE.replace(
-        "CONNECTION_NAME", connection_name
-    ).replace("NODE_FIELDS", node_fields)
-    nodes: list[dict] = []
+def fetch_all_pages(api_path: str, items_key: str | None = None) -> list[dict]:
+    """Every item of a paginated REST list. items_key names the list when the response wraps it."""
+    separator = "&" if "?" in api_path else "?"
+    items: list[dict] = []
+    page_number = 1
+    while True:
+        response = json.loads(
+            run_gh_with_stored_login(
+                ["api", f"{api_path}{separator}per_page={REST_PAGE_SIZE}&page={page_number}"]
+            )
+        )
+        page_items = response[items_key] if items_key else response
+        items.extend(page_items)
+        if len(page_items) < REST_PAGE_SIZE:
+            return items
+        page_number += 1
+
+
+def describe_metadata_author(user: dict) -> dict:
+    """The PR author as `gh pr view --json author` gives it. Cloud sessions can't read users/,
+    so the name is unknown."""
+    if user["type"] == "Bot":
+        return {"is_bot": True, "login": user["login"]}
+    return {"id": user["node_id"], "is_bot": False, "login": user["login"], "name": None}
+
+
+def describe_commit(commit: dict) -> dict:
+    """A PR commit as `gh pr view --json commits` gives it. REST names only the commit's author,
+    not co-authors from Co-authored-by trailers."""
+    headline, _, body = commit["commit"]["message"].partition("\n")
+    github_user = commit["author"] or {}
+    return {
+        "authoredDate": commit["commit"]["author"]["date"],
+        "authors": [
+            {
+                "email": commit["commit"]["author"]["email"],
+                "id": github_user.get("node_id", ""),
+                "login": github_user.get("login", ""),
+                "name": commit["commit"]["author"]["name"],
+            }
+        ],
+        "committedDate": commit["commit"]["committer"]["date"],
+        "messageBody": body.strip(),
+        "messageHeadline": headline,
+        "oid": commit["sha"],
+    }
+
+
+def build_metadata(pull_request: dict, pull_request_path: str, canonical_url: str) -> dict:
+    """The fields `gh pr view --json` gave this script, with the same names and shapes."""
+    return {
+        "additions": pull_request["additions"],
+        "author": describe_metadata_author(pull_request["user"]),
+        "baseRefName": pull_request["base"]["ref"],
+        "body": pull_request["body"] or "",
+        "commits": [
+            describe_commit(commit) for commit in fetch_all_pages(f"{pull_request_path}/commits")
+        ],
+        "deletions": pull_request["deletions"],
+        "files": [
+            {
+                "path": file["filename"],
+                "additions": file["additions"],
+                "deletions": file["deletions"],
+            }
+            for file in fetch_all_pages(f"{pull_request_path}/files")
+        ],
+        "headRefName": pull_request["head"]["ref"],
+        "title": pull_request["title"],
+        "url": canonical_url,
+    }
+
+
+def describe_author(node: dict) -> dict:
+    # GitHub returns a null user for some deleted accounts and displays them as "ghost".
+    if node["user"] is None:
+        return {"author": "ghost", "author_is_bot": False}
+    return {"author": node["user"]["login"], "author_is_bot": node["user"]["type"] == "Bot"}
+
+
+def group_review_comments_into_threads(review_comments: list[dict]) -> list[list[dict]]:
+    """Review comments grouped by thread, oldest first. A reply's in_reply_to_id is the comment
+    it answers."""
+    comments_by_id = {comment["id"]: comment for comment in review_comments}
+    threads: dict[int, list[dict]] = {}
+    for comment in sorted(review_comments, key=lambda comment: comment["id"]):
+        root = comment
+        while root.get("in_reply_to_id") in comments_by_id:
+            root = comments_by_id[root["in_reply_to_id"]]
+        threads.setdefault(root["id"], []).append(comment)
+    return list(threads.values())
+
+
+def login_of(user: object) -> str | None:
+    if isinstance(user, dict):
+        user = user.get("login")
+    return user if isinstance(user, str) else None
+
+
+def first_present(node: dict, keys: tuple[str, ...]) -> object:
+    return next((node[key] for key in keys if key in node), None)
+
+
+def integer_ids(node: dict, keys: tuple[str, ...]) -> set[int]:
+    values = [node.get(key) for key in keys]
+    return {
+        int(value)
+        for value in values
+        if (isinstance(value, int) and not isinstance(value, bool))
+        or (isinstance(value, str) and value.isdigit())
+    }
+
+
+def fetch_resolutions_from_ccr_route(pull_request_location: dict[str, str]) -> dict[int, dict]:
+    response = json.loads(
+        run_gh_with_stored_login(["api", CCR_REVIEW_THREADS_ROUTE.format(**pull_request_location)])
+    )
+    threads = (
+        response if isinstance(response, list) else first_present(response, CCR_THREAD_LIST_KEYS)
+    )
+    if not isinstance(threads, list):
+        raise PullRequestFetchError(f"unexpected response: {json.dumps(response)[:200]}")
+    resolutions = {}
+    for thread in threads:
+        is_resolved = first_present(thread, ("is_resolved", "isResolved", "resolved"))
+        if not isinstance(is_resolved, bool):
+            raise PullRequestFetchError(f"no resolved flag in thread: {json.dumps(thread)[:200]}")
+        resolution = {
+            "is_resolved": is_resolved,
+            "resolved_by": login_of(first_present(thread, ("resolved_by", "resolvedBy"))),
+        }
+        comments = thread.get("comments") or []
+        if isinstance(comments, dict):
+            comments = comments.get("nodes") or []
+        comment_ids = integer_ids(thread, CCR_THREAD_COMMENT_ID_KEYS).union(
+            *(integer_ids(comment, CCR_COMMENT_ID_KEYS) for comment in comments)
+        )
+        resolutions.update(dict.fromkeys(comment_ids, resolution))
+    return resolutions
+
+
+def fetch_resolutions_from_graphql(pull_request_location: dict[str, str]) -> dict[int, dict]:
+    resolutions = {}
     page_cursor = None
     while True:
         gh_arguments = [
             "api",
             "graphql",
             "-f",
-            f"query={query}",
+            f"query={REVIEW_THREAD_RESOLUTION_QUERY}",
             "-f",
             f"owner={pull_request_location['owner']}",
             "-f",
@@ -141,18 +264,55 @@ def fetch_all_connection_nodes(
         if page_cursor is not None:
             gh_arguments += ["-f", f"cursor={page_cursor}"]
         response = json.loads(run_gh_with_stored_login(gh_arguments))
-        connection = response["data"]["repository"]["pullRequest"][connection_name]
-        nodes.extend(connection["nodes"])
+        connection = response["data"]["repository"]["pullRequest"]["reviewThreads"]
+        for thread in connection["nodes"]:
+            resolution = {
+                "is_resolved": thread["isResolved"],
+                "resolved_by": thread["resolvedBy"]["login"] if thread["resolvedBy"] else None,
+            }
+            for comment in thread["comments"]["nodes"]:
+                resolutions[comment["databaseId"]] = resolution
         if not connection["pageInfo"]["hasNextPage"]:
-            return nodes
+            return resolutions
         page_cursor = connection["pageInfo"]["endCursor"]
 
 
-def describe_author(node: dict) -> dict:
-    # GitHub returns a null author for deleted accounts and displays them as "ghost".
-    if node["author"] is None:
-        return {"author": "ghost", "author_is_bot": False}
-    return {"author": node["author"]["login"], "author_is_bot": node["author"]["__typename"] == "Bot"}
+RESOLUTION_SOURCES = (
+    ("ccr/review_threads route", fetch_resolutions_from_ccr_route),
+    ("GraphQL", fetch_resolutions_from_graphql),
+)
+
+
+def find_thread_resolution(
+    thread_comments: list[dict], resolutions: dict[int, dict]
+) -> dict | None:
+    return next(
+        (resolutions[comment["id"]] for comment in thread_comments if comment["id"] in resolutions),
+        None,
+    )
+
+
+def fetch_review_thread_resolutions(
+    pull_request_location: dict[str, str], threads: list[list[dict]]
+) -> tuple[dict[int, dict], list[str]]:
+    """Resolution of each thread, keyed by review comment id, and why some could not be found.
+
+    Tries each source until every thread has an answer. Earlier sources win where both answer.
+    """
+    resolutions: dict[int, dict] = {}
+    problems = []
+    for source_name, fetch_resolutions in RESOLUTION_SOURCES:
+        try:
+            resolutions = {**fetch_resolutions(pull_request_location), **resolutions}
+        except (PullRequestFetchError, LookupError, TypeError, ValueError) as fetch_error:
+            # The last line is gh's own error, without the command that came before it.
+            error_lines = str(fetch_error).splitlines() or [type(fetch_error).__name__]
+            problems.append(f"{source_name}: {error_lines[-1]}")
+            continue
+        if all(find_thread_resolution(thread, resolutions) for thread in threads):
+            return resolutions, []
+        problems.append(f"{source_name}: did not cover every review thread")
+    return resolutions, problems
 
 
 def is_resolved_by_author_without_reply(review_thread: dict, pull_request_author: str) -> bool:
@@ -163,32 +323,37 @@ def is_resolved_by_author_without_reply(review_thread: dict, pull_request_author
     )
 
 
-def fetch_discussion(pull_request_location: dict[str, str], pull_request_author: str) -> dict:
+def fetch_discussion(
+    pull_request_location: dict[str, str], pull_request_path: str, pull_request_author: str
+) -> tuple[dict, list[str]]:
+    """The PR discussion, and why some review threads' resolved state is unknown, if it is.
+    Their is_resolved is None."""
+    threads = group_review_comments_into_threads(fetch_all_pages(f"{pull_request_path}/comments"))
+    resolutions, resolution_problems = (
+        fetch_review_thread_resolutions(pull_request_location, threads) if threads else ({}, [])
+    )
+    unknown_resolution = {"is_resolved": None, "resolved_by": None}
     review_threads = []
-    for thread in fetch_all_connection_nodes(
-        pull_request_location, "reviewThreads", REVIEW_THREAD_FIELDS
-    ):
-        if thread["comments"]["pageInfo"]["hasNextPage"]:
-            raise PullRequestFetchError(
-                f"A review thread on {thread['path']} has more than 100 comments; "
-                "fetching only some of them would misreport whether it was resolved."
-            )
-        thread_comments = thread["comments"]["nodes"]
+    for thread_comments in threads:
+        root_comment = thread_comments[0]
+        resolution = find_thread_resolution(thread_comments, resolutions) or unknown_resolution
         review_thread = {
-            "path": thread["path"],
-            "line": thread["line"],
-            "original_line": thread["originalLine"],
-            "diff_side": thread["diffSide"],
-            "is_resolved": thread["isResolved"],
-            "resolved_by": thread["resolvedBy"]["login"] if thread["resolvedBy"] else None,
-            "is_outdated": thread["isOutdated"],
-            "original_diff_hunk": thread_comments[0]["diffHunk"],
+            "path": root_comment["path"],
+            "line": root_comment.get("line"),
+            "original_line": root_comment.get("original_line"),
+            "diff_side": root_comment.get("side"),
+            "is_resolved": resolution["is_resolved"],
+            "resolved_by": resolution["resolved_by"],
+            # REST drops the position of a line comment whose code has changed since.
+            "is_outdated": root_comment.get("position") is None
+            and root_comment.get("subject_type") != "file",
+            "original_diff_hunk": root_comment["diff_hunk"],
             "comments": [
                 {
                     **describe_author(comment),
                     "body": comment["body"],
-                    "created_at": comment["createdAt"],
-                    "url": comment["url"],
+                    "created_at": comment["created_at"],
+                    "url": comment["html_url"],
                 }
                 for comment in thread_comments
             ],
@@ -202,29 +367,28 @@ def fetch_discussion(pull_request_location: dict[str, str], pull_request_author:
             **describe_author(review),
             "state": review["state"],
             "body": review["body"],
-            "submitted_at": review["submittedAt"],
-            "url": review["url"],
+            "submitted_at": review["submitted_at"],
+            "url": review["html_url"],
         }
-        for review in fetch_all_connection_nodes(pull_request_location, "reviews", REVIEW_FIELDS)
-        if review["body"].strip()
+        for review in fetch_all_pages(f"{pull_request_path}/reviews")
+        if (review["body"] or "").strip()
     ]
+    issue_path = "repos/{owner}/{repository}/issues/{number}".format(**pull_request_location)
     conversation_comments = [
         {
             **describe_author(comment),
             "body": comment["body"],
-            "created_at": comment["createdAt"],
-            "url": comment["url"],
+            "created_at": comment["created_at"],
+            "url": comment["html_url"],
         }
-        for comment in fetch_all_connection_nodes(
-            pull_request_location, "comments", CONVERSATION_COMMENT_FIELDS
-        )
+        for comment in fetch_all_pages(f"{issue_path}/comments")
     ]
     return {
         "pull_request_author": pull_request_author,
         "review_threads": review_threads,
         "review_summaries": review_summaries,
         "conversation_comments": conversation_comments,
-    }
+    }, resolution_problems
 
 
 def find_jira_ticket_keys(metadata: dict) -> list[str]:
@@ -312,19 +476,13 @@ def main() -> None:
         **url_match.groupdict()
     )
 
-    head_commit = run_gh_with_stored_login(
-        [
-            "api",
-            "repos/{owner}/{repository}/pulls/{number}".format(**url_match.groupdict()),
-            "--jq",
-            ".head.sha",
-        ]
-    ).strip()
-    metadata_json = run_gh_with_stored_login(
-        ["pr", "view", canonical_url, "--json", PULL_REQUEST_METADATA_FIELDS]
+    pull_request_path = "repos/{owner}/{repository}/pulls/{number}".format(**url_match.groupdict())
+    pull_request = json.loads(run_gh_with_stored_login(["api", pull_request_path]))
+    head_commit = pull_request["head"]["sha"]
+    metadata = build_metadata(pull_request, pull_request_path, canonical_url)
+    full_diff_text = run_gh_with_stored_login(
+        ["api", pull_request_path, "-H", "Accept: application/vnd.github.diff"]
     )
-    metadata = json.loads(metadata_json)
-    full_diff_text = run_gh_with_stored_login(["pr", "diff", canonical_url])
 
     file_sections = split_diff_into_file_sections(full_diff_text)
     per_file_stats = git_numstat_per_file_section(full_diff_text)
@@ -363,11 +521,18 @@ def main() -> None:
     metadata_path = output_directory / "metadata.json"
     review_diff_path = output_directory / "review.diff"
     discussion_path = output_directory / "discussion.json"
-    metadata_path.write_text(metadata_json)
+    metadata_path.write_text(json.dumps(metadata, indent=2))
     review_diff_path.write_text("".join(review_sections))
-    discussion = fetch_discussion(url_match.groupdict(), metadata["author"]["login"])
+    discussion, resolution_problems = fetch_discussion(
+        url_match.groupdict(), pull_request_path, metadata["author"]["login"]
+    )
     discussion_path.write_text(json.dumps(discussion, indent=2))
 
+    resolution_unavailable = (
+        {"review_thread_resolution_unavailable": "; ".join(resolution_problems)}
+        if resolution_problems
+        else {}
+    )
     json.dump(
         {
             "pull_request_url": canonical_url,
@@ -383,9 +548,11 @@ def main() -> None:
             "jira_ticket_keys": find_jira_ticket_keys(metadata),
             "discussion_path": str(discussion_path),
             "review_thread_count": len(discussion["review_threads"]),
+            # Threads whose resolved state is unknown count as unresolved.
             "unresolved_review_thread_count": sum(
                 not thread["is_resolved"] for thread in discussion["review_threads"]
             ),
+            **resolution_unavailable,
             "resolved_by_author_without_reply_count": sum(
                 thread["resolved_by_author_without_reply"] for thread in discussion["review_threads"]
             ),
